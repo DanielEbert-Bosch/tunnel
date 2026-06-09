@@ -1,6 +1,9 @@
 import asyncio
 import websockets
 
+OPEN_TOKEN = "__OPEN__"
+CLOSE_TOKEN = "__CLOSE__"
+
 # Dictionary to hold connected VMs: {"vm_id": websocket_connection}
 vms = {}
 # VMs that currently have an active laptop bridge. A single vm_ws can only
@@ -45,18 +48,36 @@ async def handler(websocket):
             return
         busy.add(target_vm)
 
+        try:
+            await vm_ws.send(OPEN_TOKEN)
+        except websockets.exceptions.ConnectionClosed:
+            if vms.get(target_vm) is vm_ws:
+                del vms[target_vm]
+            busy.discard(target_vm)
+            await websocket.send("ERROR: VM disconnected")
+            return
+
         await websocket.send("CONNECTED")
         print(f"Laptop bridged to {target_vm}")
 
-        async def forward(src, dst):
+        async def forward_l2v():
             try:
-                async for message in src:
-                    await dst.send(message)
+                async for message in websocket:
+                    if isinstance(message, bytes):
+                        await vm_ws.send(message)
             except websockets.exceptions.ConnectionClosed:
                 pass
 
-        task_l2v = asyncio.ensure_future(forward(websocket, vm_ws))
-        task_v2l = asyncio.ensure_future(forward(vm_ws, websocket))
+        async def forward_v2l():
+            try:
+                async for message in vm_ws:
+                    if isinstance(message, bytes):
+                        await websocket.send(message)
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
+        task_l2v = asyncio.ensure_future(forward_l2v())
+        task_v2l = asyncio.ensure_future(forward_v2l())
 
         # As soon as EITHER direction ends (e.g. the laptop disconnects),
         # cancel the other so we never leave a dangling recv() on the
@@ -73,6 +94,10 @@ async def handler(websocket):
             # Let cancellation settle so vm_ws is free for the next laptop.
             await asyncio.gather(*pending, return_exceptions=True)
         finally:
+            try:
+                await vm_ws.send(CLOSE_TOKEN)
+            except websockets.exceptions.ConnectionClosed:
+                pass
             busy.discard(target_vm)
         print(f"Laptop disconnected from {target_vm}")
 
